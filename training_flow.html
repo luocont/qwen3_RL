@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>GRPO 训练流程图 & 数据流图</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #0f1117;
+    color: #e2e8f0;
+    padding: 32px;
+    min-height: 100vh;
+  }
+  h1 {
+    text-align: center;
+    font-size: 22px;
+    font-weight: 700;
+    color: #a78bfa;
+    margin-bottom: 6px;
+    letter-spacing: 2px;
+  }
+  .section-title {
+    font-size: 16px;
+    font-weight: 700;
+    color: #60a5fa;
+    margin: 36px 0 14px 0;
+    padding-left: 12px;
+    border-left: 4px solid #3b82f6;
+    letter-spacing: 1px;
+  }
+  .diagram-container {
+    background: #1a1d2e;
+    border: 1px solid #2d3148;
+    border-radius: 16px;
+    padding: 32px 24px;
+    overflow-x: auto;
+    margin-bottom: 8px;
+  }
+  .mermaid { display: flex; justify-content: center; }
+  .subtitle {
+    text-align: center;
+    font-size: 12px;
+    color: #475569;
+    margin-bottom: 28px;
+  }
+</style>
+</head>
+<body>
+
+<h1>🧠 GRPO 在线交互式训练</h1>
+<p class="subtitle">数据流图 · 训练流程图</p>
+
+<!-- ═══════════════════════════════════════════════════════ -->
+<div class="section-title">① 数据流图 — 每轮各角色的输入与输出</div>
+<div class="diagram-container">
+<div class="mermaid">
+flowchart LR
+    JSON[("📄 counseling_dataset.json\nintake_form\nattitude")]
+
+    subgraph CLIENT["🟡 ClientAgent"]
+        C_IN["输入:\n· intake_form\n· attitude\n· shared_text_history"]
+        C_OUT["输出:\nClient: 来访者发言\n（含[/END]则结束）"]
+        C_IN --> C_OUT
+    end
+
+    subgraph FIVE_PS["🟣 FivePsAgent"]
+        F_IN["输入:\n· shared_text_history\n· current_5ps（上轮参考病例）"]
+        F_OUT["输出:\n<5Ps>\nP1~P5本轮更新\n</5Ps>\n= current_5ps"]
+        F_IN --> F_OUT
+    end
+
+    subgraph COUNSELOR["🔵 CounselorAgent"]
+        CO_IN["输入:\n· shared_dialogue_history\n· current_5ps"]
+        CO_OUT["输出:\n<think>思考</think>\n回复内容\n= agent_full_output"]
+        CO_IN --> CO_OUT
+    end
+
+    subgraph BUILD["🔴 build_prompt()"]
+        B1["system:\n{5ps_case} = prev_5ps\n（上轮最优采样的<5Ps>）\n\n{智能体输出} =\ncurrent_5ps\n+ agent_full_output"]
+        B2["messages[-2:]:\nshared_dialogue_history\n最近1轮"]
+        B1 & B2 --> PROMPT["最终 Prompt\n传给 Qwen3"]
+    end
+
+    subgraph QWEN3["🔴 Qwen3-8B（被训练模型）"]
+        Q_IN["输入: Prompt"]
+        Q_G1["G1: <5Ps>...</5Ps><think>...</think>回复"]
+        Q_G2["G2: <5Ps>...</5Ps><think>...</think>回复"]
+        Q_G3["G3: <5Ps>...</5Ps><think>...</think>回复"]
+        Q_G4["G4: <5Ps>...</5Ps><think>...</think>回复"]
+        Q_IN --> Q_G1 & Q_G2 & Q_G3 & Q_G4
+    end
+
+    subgraph REWARD["🟢 奖励计算（×4独立）"]
+        R1["G1: PANAS改善 + 格式"]
+        R2["G2: PANAS改善 + 格式"]
+        R3["G3: PANAS改善 + 格式"]
+        R4["G4: PANAS改善 + 格式"]
+    end
+
+    subgraph GRPO["⚡ GRPO更新"]
+        ADV["组内归一化\nadvantage_i = (r_i - mean) / std"]
+        CLIP["clip策略梯度损失\nAdamW.step()"]
+        ADV --> CLIP
+    end
+
+    subgraph BEST["🏆 选最优"]
+        BEST_C["best_completion = argmax(rewards)"]
+        BEST_R["extract_reply → best_reply\n追加到 shared_dialogue_history"]
+        BEST_5PS["extract_5ps → prev_5ps\n供下一轮 {5ps_case} 使用"]
+        BEST_C --> BEST_R & BEST_5PS
+    end
+
+    subgraph PANAS_EVAL["🟢 PanasEvaluator"]
+        PA_IN["输入: shared_text_history[-2000:]"]
+        PA_OUT["输出: PA/NA均值\n→ panas_prev（下轮基准）"]
+        PA_IN --> PA_OUT
+    end
+
+    JSON -->|"每个Episode"| C_IN
+    C_OUT -->|"追加 user"| F_IN
+    C_OUT -->|"追加 user"| CO_IN
+    F_OUT -->|"current_5ps"| CO_IN
+    F_OUT -->|"current_5ps"| B1
+    CO_OUT -->|"agent_full_output"| B1
+    BEST_5PS -->|"prev_5ps\n（下一轮）"| B1
+    PROMPT --> Q_IN
+    Q_G1 --> R1
+    Q_G2 --> R2
+    Q_G3 --> R3
+    Q_G4 --> R4
+    R1 & R2 & R3 & R4 --> ADV
+    CLIP -->|"参数更新完成"| BEST_C
+    BEST_R -->|"追加 assistant\n更新 shared_text_history"| C_IN
+    BEST_R -->|"追加 assistant"| CO_IN
+    PA_OUT -->|"panas_prev\n（下一轮）"| R1 & R2 & R3 & R4
+
+    style CLIENT fill:#3b2a00,stroke:#f59e0b,color:#fef3c7
+    style FIVE_PS fill:#2e1065,stroke:#7c3aed,color:#ede9fe
+    style COUNSELOR fill:#0c2a3e,stroke:#0ea5e9,color:#e0f2fe
+    style BUILD fill:#3b0000,stroke:#ef4444,color:#fee2e2
+    style QWEN3 fill:#3b0000,stroke:#ef4444,color:#fee2e2
+    style REWARD fill:#052e16,stroke:#10b981,color:#d1fae5
+    style GRPO fill:#1e3a5f,stroke:#3b82f6,color:#bfdbfe
+    style BEST fill:#052e16,stroke:#10b981,color:#d1fae5
+    style PANAS_EVAL fill:#052e16,stroke:#10b981,color:#d1fae5
+</div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════ -->
+<div class="section-title">② 训练流程图 — Episode 完整时序</div>
+<div class="diagram-container">
+<div class="mermaid">
+flowchart TD
+    START(["🚀 加载模型 & 数据集\nQwen3-8B · bfloat16 · model.train()"])
+    START --> EP_INIT
+
+    EP_INIT["Episode 初始化\nshared_dialogue_history = []\nshared_text_history = ''\ncurrent_5ps = DEFAULT_5PS\nprev_5ps = DEFAULT_5PS"]
+
+    EP_INIT --> PANAS_BASE
+    PANAS_BASE["🟢 PANAS 基线\npanas_prev = evaluate(intake_form)\n建立本 Episode 情绪基准"]
+
+    PANAS_BASE --> TURN_N
+
+    subgraph LOOP["每轮对话（Turn 1 ~ 30）"]
+        direction TB
+
+        TURN_N(["Turn N 开始"])
+
+        CLIENT_SPEAK["🟡 ClientAgent\n读取 shared_text_history\n输出来访者发言\n→ 追加到 shared_dialogue_history & shared_text_history"]
+
+        END_CHECK_EARLY{"含 [/END]?"}
+
+        FIVE_PS_UPDATE["🟣 FivePsAgent\n基于 shared_text_history\n输出 current_5ps（本轮更新病例）"]
+
+        COUNSELOR_SPEAK["🔵 CounselorAgent\n基于 shared_dialogue_history + current_5ps\n输出 agent_full_output\n格式: <think>...</think>回复"]
+
+        BUILD_PROMPT["🔴 build_prompt()\nsystem:\n  {5ps_case} = prev_5ps（上轮最优采样的<5Ps>）\n  {智能体输出} = current_5ps + agent_full_output\nmessages: shared_dialogue_history[-2:]"]
+
+        SAMPLE["🎲 Qwen3 采样 ×4\nG1 / G2 / G3 / G4\n记录各自 old_log_probs"]
+
+        subgraph REWARD_BLOCK["G1~G4 各自独立计算奖励"]
+            direction LR
+            RG1["G1\nextract_reply\n→ PANAS(panas_prev)\n→ 格式检查\n→ 0.7×PANAS + 0.3×格式"]
+            RG2["G2\nextract_reply\n→ PANAS(panas_prev)\n→ 格式检查\n→ 0.7×PANAS + 0.3×格式"]
+            RG3["G3\nextract_reply\n→ PANAS(panas_prev)\n→ 格式检查\n→ 0.7×PANAS + 0.3×格式"]
+            RG4["G4\nextract_reply\n→ PANAS(panas_prev)\n→ 格式检查\n→ 0.7×PANAS + 0.3×格式"]
+        end
+
+        GRPO_UPDATE["⚡ GRPO 参数更新\nadv_i = (r_i - mean) / std\nloss = -min(ratio×adv, clip(ratio,ε)×adv)\nAdamW.step() · global_step += 1"]
+
+        SELECT["🏆 选最优\nbest_idx = argmax(rewards)\nbest_reply = extract_reply(G_best)\nbest_5ps  = extract_5ps(G_best)"]
+
+        APPEND["追加到共享历史\nshared_dialogue_history ← assistant: best_reply\nshared_text_history ← Counselor: best_reply\nprev_5ps ← best_5ps（若提取成功）"]
+
+        PANAS_ROLL["🟢 滚动 PANAS\npanas_prev = evaluate(shared_text_history[-2000:])\n供下一轮奖励计算使用"]
+
+        END_CHECK{"含 [/END]?"}
+
+        TURN_N --> CLIENT_SPEAK
+        CLIENT_SPEAK --> END_CHECK_EARLY
+        END_CHECK_EARLY -- "是" --> EP_END
+        END_CHECK_EARLY -- "否" --> FIVE_PS_UPDATE
+        FIVE_PS_UPDATE --> COUNSELOR_SPEAK
+        COUNSELOR_SPEAK --> BUILD_PROMPT
+        BUILD_PROMPT --> SAMPLE
+        SAMPLE --> RG1 & RG2 & RG3 & RG4
+        RG1 & RG2 & RG3 & RG4 --> GRPO_UPDATE
+        GRPO_UPDATE --> SELECT
+        SELECT --> APPEND
+        APPEND --> PANAS_ROLL
+        PANAS_ROLL --> END_CHECK
+        END_CHECK -- "否，继续" --> TURN_N
+        END_CHECK -- "是，结束" --> EP_END
+    end
+
+    EP_END(["Episode 结束\n每50步保存 checkpoint"])
+    EP_END --> MORE{"还有更多\nEpisode?"}
+    MORE -- "是" --> EP_INIT
+    MORE -- "否" --> SAVE
+    SAVE(["💿 保存最终模型\noutputs/grpo_counselor/"])
+
+    style LOOP fill:#1a1d2e,stroke:#7c3aed,color:#e2e8f0
+    style REWARD_BLOCK fill:#0f1117,stroke:#10b981,color:#e2e8f0
+    style START fill:#4f46e5,stroke:#6366f1,color:#fff
+    style SAVE fill:#4f46e5,stroke:#6366f1,color:#fff
+    style EP_END fill:#1e3a5f,stroke:#3b82f6,color:#bfdbfe
+    style GRPO_UPDATE fill:#1e3a5f,stroke:#3b82f6,color:#bfdbfe
+    style SELECT fill:#052e16,stroke:#10b981,color:#d1fae5
+    style APPEND fill:#052e16,stroke:#10b981,color:#d1fae5
+    style BUILD_PROMPT fill:#3b0000,stroke:#ef4444,color:#fee2e2
+    style PANAS_BASE fill:#052e16,stroke:#10b981,color:#d1fae5
+    style PANAS_ROLL fill:#052e16,stroke:#10b981,color:#d1fae5
+    style CLIENT_SPEAK fill:#3b2a00,stroke:#f59e0b,color:#fef3c7
+    style FIVE_PS_UPDATE fill:#2e1065,stroke:#7c3aed,color:#ede9fe
+    style COUNSELOR_SPEAK fill:#0c2a3e,stroke:#0ea5e9,color:#e0f2fe
+    style SAMPLE fill:#3b0000,stroke:#ef4444,color:#fee2e2
+</div>
+</div>
+
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'dark',
+    themeVariables: {
+      primaryColor: '#4f46e5',
+      primaryTextColor: '#e2e8f0',
+      primaryBorderColor: '#6366f1',
+      lineColor: '#64748b',
+      secondaryColor: '#1e2130',
+      tertiaryColor: '#0f1117',
+      background: '#1a1d2e',
+      mainBkg: '#1e2130',
+      nodeBorder: '#4f46e5',
+      clusterBkg: '#1a1d2e',
+      titleColor: '#a78bfa',
+      edgeLabelBackground: '#1e2130',
+      fontSize: '13px',
+    },
+    flowchart: {
+      curve: 'basis',
+      padding: 20,
+      nodeSpacing: 40,
+      rankSpacing: 50,
+    }
+  });
+</script>
+</body>
+</html>
